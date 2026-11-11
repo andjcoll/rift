@@ -29,6 +29,7 @@ pub struct ActionConfig {
     tolerance: f64,
     threshold: f64,
     pub scrolling: bool,
+    vertical: bool,
     pub propagate: bool,
     pub boundary_threshold: f64,
     pub animate: Option<bool>,
@@ -37,6 +38,7 @@ pub struct ActionConfig {
 pub struct Settings {
     scroll: Option<ActionConfig>,
     workspace: Option<ActionConfig>,
+    overview: Option<ActionConfig>,
     consume: bool,
     skip_empty: Option<bool>,
     haptic: Option<HapticPattern>,
@@ -53,12 +55,25 @@ impl Settings {
             consume: g.consume_dock_swipe,
             skip_empty: Some(g.skip_empty),
             haptic: g.haptics_enabled.then_some(g.haptic_pattern),
+            overview: (g.mission_control_enabled && config.settings.ui.mission_control.enabled)
+                .then_some(ActionConfig {
+                    fingers: g.mission_control_fingers.max(1),
+                    invert: false,
+                    tolerance: 1.0,
+                    threshold: g.mission_control_distance_pct.clamp(0.01, 1.0),
+                    scrolling: false,
+                    vertical: true,
+                    propagate: false,
+                    boundary_threshold: 0.0,
+                    animate: None,
+                }),
             workspace: g.enabled.then_some(ActionConfig {
                 fingers: g.fingers.max(1),
                 invert: g.invert_horizontal_swipe,
                 tolerance: tolerance(g.swipe_vertical_tolerance),
                 threshold: g.distance_pct.clamp(0.01, 1.0),
                 scrolling: false,
+                vertical: false,
                 propagate: false,
                 boundary_threshold: 0.0,
                 animate: None,
@@ -69,6 +84,7 @@ impl Settings {
                 tolerance: tolerance(s.vertical_tolerance),
                 threshold: 0.0,
                 scrolling: true,
+                vertical: false,
                 propagate: s.propagate_to_workspace_swipe,
                 boundary_threshold: s.workspace_switch_threshold.max(0.0),
                 animate: None,
@@ -76,16 +92,40 @@ impl Settings {
         }
     }
 
-    pub fn enabled(self) -> bool { self.scroll.is_some() || self.workspace.is_some() }
-
-    fn accepts_count(self, fingers: usize) -> bool {
-        self.scroll.into_iter().chain(self.workspace).any(|a| a.fingers == fingers)
+    pub fn enabled(self) -> bool {
+        self.scroll.is_some() || self.workspace.is_some() || self.overview.is_some()
     }
 
-    fn action_for(self, mode: LayoutMode, fingers: usize) -> Option<ActionConfig> {
+    fn accepts_count(self, fingers: usize) -> bool {
+        self.scroll
+            .into_iter()
+            .chain(self.workspace)
+            .chain(self.overview)
+            .any(|a| a.fingers == fingers)
+    }
+
+    pub fn vertical_enabled(self) -> bool { self.overview.is_some() }
+
+    pub fn for_overview(mut self, active: bool, available: bool) -> Self {
+        if active {
+            self.scroll = None;
+            self.workspace = None;
+        }
+        if !available {
+            self.overview = None;
+        }
+        self
+    }
+
+    fn horizontal_for(self, mode: LayoutMode, fingers: usize) -> Option<ActionConfig> {
         self.scroll
             .filter(|a| mode == LayoutMode::Scrolling && a.fingers == fingers)
             .or_else(|| self.workspace.filter(|a| a.fingers == fingers))
+    }
+
+    fn action_for(self, mode: LayoutMode, fingers: usize) -> Option<ActionConfig> {
+        self.horizontal_for(mode, fingers)
+            .or_else(|| self.overview.filter(|a| a.fingers == fingers))
     }
 }
 #[derive(Clone, Debug)]
@@ -131,6 +171,7 @@ pub struct Control {
     motion: Arc<Mutex<Option<Motion>>>,
     owner: Arc<Mutex<Ownership>>,
     stop: Arc<AtomicBool>,
+    overview: Arc<Mutex<Option<super::mission_control::Sender>>>,
 }
 impl Control {
     pub fn publish(&self, motion: Motion) { *self.motion.lock() = Some(motion); }
@@ -152,6 +193,7 @@ impl Control {
             motion: Arc::default(),
             owner: Arc::default(),
             stop: Arc::default(),
+            overview: Arc::default(),
         }
     }
 
@@ -174,6 +216,8 @@ impl Control {
             consume: context.consume,
             touching: true,
             dock_owner: owner.dock_owner,
+            horizontal: !context.action.vertical,
+            vertical: context.action.vertical,
         };
         true
     }
@@ -181,6 +225,11 @@ impl Control {
     pub fn valid(&self, epoch: u64) -> bool {
         let r = self.routing.lock();
         r.epoch == epoch && r.enabled
+    }
+
+    pub fn owns_vertical(&self) -> bool {
+        let owner = self.owner.lock();
+        owner.owner == Owner::Rift && owner.vertical
     }
 
     pub fn configure(
@@ -265,7 +314,12 @@ impl Control {
         ))
     }
 
-    pub fn start(&self, tx: Sender) -> multitouch::Monitor {
+    pub fn start(
+        &self,
+        tx: Sender,
+        overview: Option<super::mission_control::Sender>,
+    ) -> multitouch::Monitor {
+        *self.overview.lock() = overview;
         let control = self.clone();
         let origin = Instant::now();
         let monitor = multitouch::Monitor::with_device_handler(move |_| {
@@ -297,7 +351,8 @@ fn swipe_recognizer(fingers: usize) -> GestureRecognizer {
 }
 struct DeviceSession {
     context: Context,
-    alternate: Option<ActionConfig>,
+    settings: Settings,
+    mode: LayoutMode,
     max_fingers: usize,
     recognizer: GestureRecognizer,
     owner: Owner,
@@ -312,14 +367,12 @@ impl DeviceSession {
     fn new(context: Context, settings: Settings, mode: LayoutMode) -> Self {
         let max_fingers = settings
             .scroll
-            .map_or(0, |a| a.fingers)
-            .max(settings.workspace.map_or(0, |a| a.fingers));
-        let alternate = if context.action.scrolling {
-            settings.workspace
-        } else {
-            settings.scroll.filter(|_| mode == LayoutMode::Scrolling)
-        }
-        .filter(|a| a.fingers != context.action.fingers);
+            .into_iter()
+            .chain(settings.workspace)
+            .chain(settings.overview)
+            .map(|a| a.fingers)
+            .max()
+            .unwrap_or(0);
         Self {
             recognizer: swipe_recognizer(context.action.fingers),
             sample: Motion {
@@ -328,7 +381,8 @@ impl DeviceSession {
                 timestamp: context.started,
             },
             context,
-            alternate,
+            settings,
+            mode,
             max_fingers,
             owner: Owner::Undecided,
             blocked: false,
@@ -393,8 +447,9 @@ impl DeviceSession {
                 return;
             }
             self.max_contacts = count;
-            if let Some(action) = self.alternate.filter(|a| a.fingers == count) {
-                self.alternate = None;
+            if count != self.recognizer.required_finger_count
+                && let Some(action) = self.settings.action_for(self.mode, count)
+            {
                 self.context.action = action;
                 self.recognizer = swipe_recognizer(action.fingers);
             }
@@ -406,27 +461,38 @@ impl DeviceSession {
         let Some(event) = self.recognizer.process(contacts) else {
             return;
         };
-        let c = &self.context;
         if let GestureEvent::Swipe(swipe) = event {
             match swipe.phase {
                 GesturePhase::Began | GesturePhase::Changed => {
                     let x = f64::from(swipe.translation.x);
-                    let y = f64::from(swipe.translation.y).abs();
+                    let y = f64::from(swipe.translation.y);
                     if self.owner == Owner::Undecided {
-                        if y > c.action.tolerance || (y >= VERTICAL_INTENT_DISTANCE && y >= x.abs())
+                        let horizontal = self.settings.horizontal_for(self.mode, count);
+                        let vertical = self.settings.overview.filter(|a| a.fingers == count);
+                        let action = if y.abs()
+                            >= vertical.map_or(VERTICAL_INTENT_DISTANCE, |a| {
+                                a.threshold.min(VERTICAL_INTENT_DISTANCE)
+                            })
+                            && y.abs() > x.abs()
                         {
-                            self.owner = Owner::System;
-                        } else if y >= x.abs() {
-                            // Like the old armed swipe handler, allow initial
-                            // placement noise to resolve into horizontal intent.
+                            vertical
+                        } else if x.abs() > y.abs() {
+                            horizontal.filter(|a| y.abs() <= a.tolerance)
+                        } else {
+                            // Allow finger placement noise to resolve into intent.
                             return;
-                        } else if control.claim(c) {
+                        };
+                        let Some(action) = action else {
+                            self.owner = Owner::System;
+                            return;
+                        };
+                        self.context.action = action;
+                        if control.claim(&self.context) {
                             self.owner = Owner::Rift;
-                            tracing::debug!(session = c.session, space = ?c.space, scrolling = c.action.scrolling, fingers = c.action.fingers, "gesture claimed");
-                            if c.action.scrolling {
+                            if action.scrolling {
                                 self.claim_x = x;
                                 self.active = true;
-                                let mut context = c.clone();
+                                let mut context = self.context.clone();
                                 context.started = time;
                                 tx.send(Event::Gesture(Lifecycle::Begin {
                                     context,
@@ -438,6 +504,20 @@ impl DeviceSession {
                         }
                     }
                     if self.owner != Owner::Rift {
+                        return;
+                    }
+                    let c = &self.context;
+                    if c.action.vertical {
+                        if y.abs() >= c.action.threshold {
+                            self.blocked = true;
+                            if let Some(tx) = &*control.overview.lock() {
+                                tx.send(super::mission_control::Event::Gesture {
+                                    open: y > 0.0,
+                                    context: c.clone(),
+                                    control: control.clone(),
+                                });
+                            }
+                        }
                         return;
                     }
                     let total_x = (x - if c.action.scrolling {
@@ -551,6 +631,16 @@ impl DeviceInput {
                     consume,
                     touching: true,
                     dock_owner: owner.dock_owner,
+                    horizontal: if s.owner == Owner::Rift {
+                        !s.context.action.vertical
+                    } else {
+                        s.settings.horizontal_for(s.mode, count).is_some()
+                    },
+                    vertical: if s.owner == Owner::Rift {
+                        s.context.action.vertical
+                    } else {
+                        s.settings.overview.is_some_and(|a| a.fingers == count)
+                    },
                 };
             }
         }
@@ -894,6 +984,116 @@ mod tests {
             assert_eq!(control.owner.lock().owner, Owner::System);
             DeviceInput::deliver(&input, multitouch::ContactEvent::Frame(&[]));
             assert!(input.lock().session.is_none());
+        }
+    }
+
+    #[test]
+    fn vertical_swipes_share_recognition_and_commit_once() {
+        for fingers in [3, 4, 5] {
+            for up in [false, true] {
+                let (mut session, control, tx, mut rx) = setup_settings(true, 4, true);
+                let mut settings = session.settings;
+                let mut action = settings.workspace.unwrap();
+                action.fingers = fingers;
+                action.vertical = true;
+                settings.overview = Some(action);
+                let context = Context::new(
+                    1,
+                    0,
+                    SpaceId::new(10),
+                    (LayoutMode::Scrolling, 3),
+                    settings,
+                    Duration::ZERO,
+                )
+                .unwrap();
+                session = DeviceSession::new(context, settings, LayoutMode::Scrolling);
+                let (overview, mut overview_rx) = crate::actor::channel();
+                *control.overview.lock() = Some(overview);
+                // Contacts may arrive one at a time before intent is established.
+                for count in 1..=fingers {
+                    session.frame(&frame(count, 0.5, 0.5), count, Duration::ZERO, &tx, &control);
+                }
+                let sign = if up { 1.0 } else { -1.0 };
+                for distance in [0.01, 0.04, 0.07] {
+                    session.frame(
+                        &frame(fingers, 0.501, 0.5 + sign * distance),
+                        fingers,
+                        Duration::ZERO,
+                        &tx,
+                        &control,
+                    );
+                    assert!(overview_rx.try_recv().is_err());
+                }
+                for distance in [0.1, 0.2, -0.2] {
+                    session.frame(
+                        &frame(fingers, 0.501, 0.5 + sign * distance),
+                        fingers,
+                        Duration::ZERO,
+                        &tx,
+                        &control,
+                    );
+                }
+                let super::super::mission_control::Event::Gesture { open, context, .. } =
+                    overview_rx.try_recv().unwrap().1
+                else {
+                    panic!("overview gesture")
+                };
+                assert_eq!(
+                    open, up,
+                    "horizontal inversion must not affect vertical direction"
+                );
+                assert!(context.action.vertical);
+                assert!(overview_rx.try_recv().is_err());
+                assert!(
+                    rx.try_recv().is_err(),
+                    "vertical intent must not scroll/switch workspaces"
+                );
+                assert!(control.owns_vertical());
+            }
+        }
+    }
+
+    #[test]
+    fn overview_settings_allow_vertical_only_and_disable_unavailable_routes() {
+        let mut config = Config::default();
+        config.settings.gestures.mission_control_enabled = true;
+        assert!(!Settings::new(&config).enabled());
+        config.settings.ui.mission_control.enabled = true;
+        let settings = Settings::new(&config);
+        assert!(settings.enabled());
+        assert!(settings.action_for(LayoutMode::Traditional, 3).unwrap().vertical);
+        assert!(!settings.for_overview(false, false).enabled());
+        config.settings.gestures.enabled = true;
+        config.settings.layout.scrolling.gestures.enabled = true;
+        let settings = Settings::new(&config).for_overview(true, true);
+        assert!(settings.scroll.is_none());
+        assert!(settings.workspace.is_none());
+        assert!(settings.overview.is_some());
+    }
+
+    #[test]
+    fn cancelled_vertical_candidates_do_not_commit() {
+        for reset in [false, true] {
+            let (mut session, control, tx, mut rx) = setup(false);
+            let mut settings = session.settings;
+            let mut action = settings.workspace.unwrap();
+            action.vertical = true;
+            settings.overview = Some(action);
+            session =
+                DeviceSession::new(session.context.clone(), settings, LayoutMode::Traditional);
+            let (overview, mut overview_rx) = crate::actor::channel();
+            *control.overview.lock() = Some(overview);
+            session.frame(&frame(3, 0.5, 0.5), 3, Duration::ZERO, &tx, &control);
+            session.frame(&frame(3, 0.501, 0.54), 3, Duration::ZERO, &tx, &control);
+            if reset {
+                control.reset(&tx);
+                rx.try_recv().unwrap();
+            } else {
+                session.end(&tx, true, Duration::ZERO);
+            }
+            session.frame(&frame(3, 0.501, 0.7), 3, Duration::ZERO, &tx, &control);
+            assert!(overview_rx.try_recv().is_err());
+            assert!(rx.try_recv().is_err());
         }
     }
 

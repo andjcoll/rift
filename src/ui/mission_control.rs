@@ -2613,6 +2613,17 @@ impl OverviewSession {
         }
     }
 
+    /// Vertical dismissal closes in one swipe, including during a window drag.
+    pub(crate) fn dismiss_gesture(&mut self) -> (bool, Option<OverviewAction>) {
+        if matches!(self.phase, Phase::Exiting { .. }) {
+            return (false, None);
+        }
+        if let Some(drag) = self.drag.take() {
+            self.end_drag(drag, true);
+        }
+        (true, self.input(Input::Dismiss))
+    }
+
     pub(crate) fn toggle(&mut self) {
         if matches!(self.phase, Phase::Exiting { .. }) {
             self.interrupt();

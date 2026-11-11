@@ -623,11 +623,28 @@ pub struct GestureSettings {
     #[serde(default)]
     #[setting(label = "Enabled", group = "main")]
     pub enabled: bool,
-    /// If true, consume horizontal swipe events owned by Rift so macOS and the
+    /// If true, consume swipe events owned by Rift so macOS and the
     /// foreground app do not also handle them.
     #[serde(default = "yes")]
-    #[setting(label = "Consume macOS workspace swipe", group = "main")]
+    #[setting(label = "Consume macOS swipes", group = "main")]
     pub consume_dock_swipe: bool,
+    /// Swipe up to open Rift's Mission Control and down to dismiss it.
+    /// Requires Mission Control to be enabled (restart Rift after enabling it).
+    #[serde(default)]
+    #[setting(label = "Enabled", group = "mission_control")]
+    pub mission_control_enabled: bool,
+    /// Number of fingers required for vertical Mission Control swipes.
+    #[serde(default = "default_swipe_fingers")]
+    #[setting(label = "Fingers", group = "mission_control")]
+    pub mission_control_fingers: usize,
+    /// Normalized vertical distance (0..1) required to commit a swipe.
+    #[serde(default = "default_distance_pct")]
+    #[setting(
+        label = "Distance (%)",
+        group = "mission_control_advanced",
+        scale = 100.0
+    )]
+    pub mission_control_distance_pct: f64,
     /// Invert horizontal direction (swap next/prev)
     #[serde(default)]
     #[setting(label = "Invert direction", group = "main")]
@@ -663,6 +680,9 @@ impl Default for GestureSettings {
         Self {
             enabled: false,
             consume_dock_swipe: true,
+            mission_control_enabled: false,
+            mission_control_fingers: default_swipe_fingers(),
+            mission_control_distance_pct: default_distance_pct(),
             invert_horizontal_swipe: false,
             swipe_vertical_tolerance: default_swipe_vertical_tolerance(),
             skip_empty: true,

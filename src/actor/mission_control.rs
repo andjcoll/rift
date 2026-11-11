@@ -18,6 +18,11 @@ pub enum Event {
     },
     PumpPreviews,
     ShowAll,
+    Gesture {
+        open: bool,
+        context: super::gesture::Context,
+        control: super::gesture::Control,
+    },
     Dismiss,
     RefreshCurrentWorkspace,
     DropFinished(super::app::WindowId, bool),
@@ -355,40 +360,28 @@ impl MissionControlActor {
                     } else {
                         self.close();
                     }
-                } else if self.settings.enabled {
-                    if self.settings.window_previews && !CGPreflightScreenCaptureAccess() {
-                        CGRequestScreenCaptureAccess();
-                        // Cancel a pending release-to-activate opener when no session was opened.
-                        self.input_tx.send(super::input::Request::SetMissionControlActive(
-                            false,
-                            Vec::new(),
-                        ));
-                        return;
+                } else {
+                    self.open();
+                }
+            }
+            Event::Gesture { open, context, control } => {
+                if !control.valid(context.epoch) || !self.settings.enabled {
+                    return;
+                }
+                self.input_tx.send(super::input::Request::ClearOverviewHotkey);
+                let changed = if open {
+                    self.open()
+                } else if let Some(session) = &mut self.session {
+                    let (changed, action) = session.dismiss_gesture();
+                    if matches!(action, Some(OverviewAction::Dismiss)) {
+                        self.close();
                     }
-                    if self.settings.window_previews {
-                        let _ = cgs::compositor::preview::PreviewCompositor::prepare();
-                    }
-                    self.session = OverviewSession::new(
-                        &self.reactor,
-                        self.mtm,
-                        &self.settings,
-                        self.shared,
-                        &mut self.cache,
-                    );
-                    if let Some(session) = &mut self.session {
-                        session.start_previews(
-                            self.settings.window_previews,
-                            self.tx.clone(),
-                            self.cache.as_mut(),
-                        );
-                    }
-                    self.input_tx.send(super::input::Request::SetMissionControlActive(
-                        self.session.is_some(),
-                        self.session.as_ref().map_or_else(Vec::new, OverviewSession::input_bounds),
-                    ));
-                    self.stack_line_tx.send(super::stack_line::Event::OverviewBounds(
-                        self.session.as_ref().map_or_else(Vec::new, OverviewSession::input_bounds),
-                    ));
+                    changed
+                } else {
+                    false
+                };
+                if changed && let Some(pattern) = context.haptic {
+                    let _ = crate::sys::haptics::perform_haptic(pattern);
                 }
             }
             Event::Dismiss => self.handle(Event::Input(Input::Dismiss)),
@@ -436,6 +429,44 @@ impl MissionControlActor {
                 }
             }
         }
+    }
+
+    fn open(&mut self) -> bool {
+        if self.session.is_some() || !self.settings.enabled {
+            return false;
+        }
+        if self.settings.window_previews && !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess();
+            // Cancel a pending release-to-activate opener when no session was opened.
+            self.input_tx
+                .send(super::input::Request::SetMissionControlActive(false, Vec::new()));
+            return false;
+        }
+        if self.settings.window_previews {
+            let _ = cgs::compositor::preview::PreviewCompositor::prepare();
+        }
+        self.session = OverviewSession::new(
+            &self.reactor,
+            self.mtm,
+            &self.settings,
+            self.shared,
+            &mut self.cache,
+        );
+        if let Some(session) = &mut self.session {
+            session.start_previews(
+                self.settings.window_previews,
+                self.tx.clone(),
+                self.cache.as_mut(),
+            );
+        }
+        self.input_tx.send(super::input::Request::SetMissionControlActive(
+            self.session.is_some(),
+            self.session.as_ref().map_or_else(Vec::new, OverviewSession::input_bounds),
+        ));
+        self.stack_line_tx.send(super::stack_line::Event::OverviewBounds(
+            self.session.as_ref().map_or_else(Vec::new, OverviewSession::input_bounds),
+        ));
+        self.session.is_some()
     }
 
     fn request_refresh(&mut self, moved: Option<super::app::WindowId>) {
