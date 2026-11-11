@@ -207,6 +207,13 @@ const MANUAL: &[(Category, Option<LayoutMode>, &str, &str, &str)] = &[
         Mouse,
         None,
         "Mouse & Trackpad",
+        "Mission Control swipes",
+        "trackpad gestures fingers swipe up down overview haptic",
+    ),
+    (
+        Mouse,
+        None,
+        "Mouse & Trackpad",
         "Scrolling layout gestures",
         "trackpad gestures fingers swipe scrolling niri",
     ),
@@ -341,6 +348,15 @@ fn catalog() -> &'static [Entry] {
             None,
             "Mouse & Trackpad › Advanced swipe settings",
         );
+        for group in ["mission_control", "mission_control_advanced"] {
+            append::<GestureSettings>(
+                &mut out,
+                group,
+                Mouse,
+                None,
+                "Mouse & Trackpad › Mission Control swipes",
+            );
+        }
         append::<ScrollingGestureSettings>(
             &mut out,
             "",

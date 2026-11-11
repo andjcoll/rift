@@ -58,6 +58,7 @@ pub enum Request {
     SetLowPowerMode(bool),
     SetMissionControlActive(bool, Vec<CGRect>),
     ReleaseMissionControl,
+    ClearOverviewHotkey,
 }
 
 // The IPC acknowledgement is sent only after this store. The input tap therefore
@@ -290,7 +291,10 @@ impl Input {
             return;
         }
 
-        self.reset_gestures();
+        // Opening/dismissing Overview must not release the swipe that caused it.
+        if !self.gesture_control.owns_vertical() {
+            self.reset_gestures();
+        }
         self.tap.borrow_mut().take();
         if next_mask == 0 {
             self.event_mask.set(0);
@@ -389,7 +393,9 @@ impl Input {
         let this = Box::new(self);
 
         this.rebuild_event_tap_mask_if_needed(&recovery_tx);
-        let _gesture_monitor = this.gesture_control.start(this.events_tx.clone());
+        let _gesture_monitor = this
+            .gesture_control
+            .start(this.events_tx.clone(), this.mission_control_tx.borrow().clone());
 
         if this.state.borrow().mouse_hides_on_focus {
             if let Err(e) = window_server::allow_hide_mouse() {
@@ -467,6 +473,7 @@ impl Input {
             }
             Request::SetMissionControlActive(active, _) => {
                 *active != self.mission_control_active.get()
+                    && !self.gesture_control.owns_vertical()
             }
             Request::ConfigUpdated(_) | Request::ReleaseMissionControl => true,
             _ => false,
@@ -474,11 +481,15 @@ impl Input {
         if reset_gestures {
             self.reset_gestures();
         }
-        let configure_gestures =
-            reset_gestures || matches!(&request, Request::SpaceStateUpdated(..));
+        let configure_gestures = reset_gestures
+            || matches!(
+                &request,
+                Request::SpaceStateUpdated(..) | Request::SetMissionControlActive(..)
+            );
         let mut should_rebuild_mask = false;
         let mut state = self.state.borrow_mut();
         match request {
+            Request::ClearOverviewHotkey => self.overview_hotkey.set(None),
             Request::ReleaseMissionControl => {
                 self.overview_hotkey.set(None);
                 self.mission_control_tx.borrow_mut().take();
@@ -668,8 +679,11 @@ impl Input {
         }
         if configure_gestures {
             self.gesture_control.configure(
-                state.gesture_settings,
-                state.event_processing_enabled && !self.mission_control_active.get(),
+                state.gesture_settings.for_overview(
+                    self.mission_control_active.get(),
+                    self.mission_control_tx.borrow().is_some(),
+                ),
+                state.event_processing_enabled,
                 state
                     .screen_spaces
                     .iter()
@@ -735,6 +749,13 @@ impl Input {
         event: &CGEvent,
         proxy: Option<CGEventTapProxy>,
     ) -> bool {
+        // Arbitrate before Overview hit-testing or pan/zoom routing, including
+        // the tail of an opening/dismissal swipe outside its current bounds.
+        if event_type == CGEventType::ScrollWheel
+            && !self.native_gesture_forward(event_type, event, proxy)
+        {
+            return false;
+        }
         if self.mission_control_active.get()
             && matches!(
                 event_type,
@@ -779,6 +800,9 @@ impl Input {
         }
         match event_type {
             ty if ty.0 == gesture::CGS_EVENT_GESTURE || ty.0 == gesture::CGS_EVENT_DOCK_CONTROL => {
+                if !self.native_gesture_forward(ty, event, proxy) {
+                    return false;
+                }
                 if self.mission_control_active.get() {
                     if !self.overview_contains(CGEvent::location(Some(event))) {
                         return true;
@@ -805,7 +829,7 @@ impl Input {
                     }
                     false
                 } else {
-                    self.native_gesture_forward(ty, event, proxy)
+                    true
                 }
             }
             CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged => {
@@ -896,7 +920,7 @@ impl Input {
                 self.send_overview(super::mission_control::Event::Input(input));
                 false
             }
-            CGEventType::ScrollWheel => self.native_gesture_forward(event_type, event, proxy),
+            CGEventType::ScrollWheel => true,
             CGEventType::MouseMoved => self.on_mouse_moved(event, CGEvent::location(Some(event))),
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 if self.mission_control_active.get() && event_type == CGEventType::LeftMouseDragged
@@ -1651,6 +1675,8 @@ mod tests {
             owner: gesture::Owner::Undecided,
             consume: true,
             touching: true,
+            horizontal: true,
+            vertical: false,
             dock_owner: None,
         };
         let event = |phase| {
@@ -2673,10 +2699,17 @@ impl Input {
         event: &CGEvent,
         proxy: Option<CGEventTapProxy>,
     ) -> bool {
+        let vertical_enabled = {
+            let state = self.state.borrow();
+            state.event_processing_enabled
+                && state.gesture_settings.vertical_enabled()
+                && self.mission_control_tx.borrow().is_some()
+        };
         let mut filter = self.gesture_filter.borrow_mut();
         filter.forward(
             ty,
             event,
+            vertical_enabled,
             || self.gesture_control.ownership_guard(),
             |held| {
                 if let Some(proxy) = proxy {

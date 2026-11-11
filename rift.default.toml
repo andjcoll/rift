@@ -249,9 +249,16 @@ spacing = 0.0
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
 enabled = false
-# If true, Rift consumes horizontal swipes handled by its trackpad gesture handlers
+# If true, Rift consumes swipes handled by its trackpad gesture handlers
 # so macOS and the foreground app do not also handle them
 consume_dock_swipe = true
+# Swipe up to open Rift's Mission Control and down to dismiss it.
+# Requires settings.ui.mission_control.enabled (restart Rift after enabling that).
+mission_control_enabled = false
+mission_control_fingers = 3
+# Normalized vertical distance (0..1) required to trigger a swipe
+mission_control_distance_pct = 0.08
+# Haptic feedback settings below apply to both workspace and Mission Control swipes.
 # Invert horizontal direction (swap next/prev)
 invert_horizontal_swipe = false
 # Maximum vertical travel allowed for the horizontal swipe to register.

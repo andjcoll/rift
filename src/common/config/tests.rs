@@ -1114,3 +1114,19 @@ fn replacing_shortcuts_is_atomic_and_scoped_to_the_reviewed_mode() {
     assert_eq!(reopened.keys, source.keys);
     assert_eq!(reopened.binding_modes, source.binding_modes);
 }
+
+#[test]
+fn mission_control_gestures_are_opt_in_and_round_trip() {
+    let old: GestureSettings = toml::from_str("enabled = true\nfingers = 4").unwrap();
+    assert!(old.enabled);
+    assert_eq!(old.fingers, 4);
+    assert!(!old.mission_control_enabled);
+    assert_eq!(old.mission_control_fingers, 3);
+    assert_eq!(old.mission_control_distance_pct, 0.08);
+    let mut configured = old;
+    configured.mission_control_enabled = true;
+    configured.mission_control_fingers = 5;
+    configured.mission_control_distance_pct = 0.12;
+    let encoded = toml::to_string(&configured).unwrap();
+    assert_eq!(toml::from_str::<GestureSettings>(&encoded).unwrap(), configured);
+}

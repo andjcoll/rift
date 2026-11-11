@@ -28,6 +28,8 @@ pub struct Ownership {
     pub owner: Owner,
     pub consume: bool,
     pub touching: bool,
+    pub horizontal: bool,
+    pub vertical: bool,
     /// Dock delivery is irrevocable once its begin has been forwarded.
     pub dock_owner: Option<Owner>,
 }
@@ -182,6 +184,8 @@ struct NativeSequence {
 #[derive(Default)]
 pub struct Filter {
     dock: NativeSequence,
+    vertical: NativeSequence,
+    vertical_app: NativeSequence,
     app: NativeSequence,
     scroll: NativeSequence,
 }
@@ -192,6 +196,7 @@ impl Filter {
         &mut self,
         ty: CGEventType,
         event: &CGEvent,
+        vertical_enabled: bool,
         ownership: impl FnOnce() -> O,
         mut post: impl FnMut(&CGEvent),
     ) -> bool {
@@ -251,22 +256,35 @@ impl Filter {
             if ty.0 != CGS_EVENT_GESTURE && ty.0 != CGS_EVENT_DOCK_CONTROL {
                 return true;
             }
-            // DockSwipe and NavigationSwipe only; digitizer, zoom, rotate,
-            // smart zoom and vertical Mission Control never enter the filter.
+            // DockSwipe: horizontal = 1, vertical = 2, pinch = 3.
+            // Keep digitizer, zoom, rotate and smart zoom out of arbitration.
             let subtype = CGEvent::integer_value_field(Some(event), HID_TYPE);
-            if !matches!(subtype, 16 | 23) || CGEvent::integer_value_field(Some(event), MOTION) != 1
-            {
+            let motion = CGEvent::integer_value_field(Some(event), MOTION);
+            if !matches!(subtype, 16 | 23) || !matches!(motion, 1 | 2) {
                 return true;
             }
             owner = ownership();
-            (
-                if ty.0 == CGS_EVENT_DOCK_CONTROL {
-                    &mut self.dock
-                } else {
-                    &mut self.app
-                },
-                CGEvent::integer_value_field(Some(event), PHASE),
-            )
+            let vertical = motion == 2;
+            let sequence = if vertical && dock {
+                &mut self.vertical
+            } else if vertical {
+                &mut self.vertical_app
+            } else if dock {
+                &mut self.dock
+            } else {
+                &mut self.app
+            };
+            // An ineligible axis must not reserve native delivery. Continue an
+            // already-owned sequence through lift even after routing changes.
+            if (if vertical {
+                !vertical_enabled || (owner.touching && !owner.vertical)
+            } else {
+                owner.touching && !owner.horizontal
+            }) && sequence.arbitration.sequence == Sequence::Passing
+            {
+                return true;
+            }
+            (sequence, CGEvent::integer_value_field(Some(event), PHASE))
         };
         if phase == 1 {
             for held in sequence.held.drain(..) {
@@ -319,7 +337,7 @@ impl Filter {
     pub fn hold_deadline(&self) -> Option<Instant> {
         // Dock replay needs the current tap proxy; it resolves on the next
         // event rather than posting an unfinished begin outside a callback.
-        [&self.app, &self.scroll]
+        [&self.app, &self.vertical_app, &self.scroll]
             .into_iter()
             .filter(|s| s.arbitration.sequence == Sequence::Holding)
             .filter_map(|s| s.arbitration.began.map(|t| t + Duration::from_millis(60)))
@@ -328,7 +346,7 @@ impl Filter {
 
     pub fn release_expired(&mut self, owner: Ownership) {
         let now = Instant::now();
-        for s in [&mut self.app, &mut self.scroll] {
+        for s in [&mut self.app, &mut self.vertical_app, &mut self.scroll] {
             if s.arbitration.sequence == Sequence::Holding
                 && s.arbitration
                     .began
@@ -353,16 +371,17 @@ impl Filter {
     }
 
     pub fn reset(&mut self) {
-        self.dock.held.clear();
-        if self.dock.arbitration.sequence == Sequence::Holding {
-            // Its begin never reached Dock. Suppress the remainder too, even
-            // if a reset/rebuilt tap occurs before the physical stroke ends.
-            self.dock.arbitration.sequence = Sequence::Dropping;
+        for sequence in [&mut self.dock, &mut self.vertical] {
+            sequence.held.clear();
+            if sequence.arbitration.sequence == Sequence::Holding {
+                // Its begin never reached Dock; suppress the remainder too.
+                sequence.arbitration.sequence = Sequence::Dropping;
+            }
+            sequence.arbitration.began = None;
         }
-        self.dock.arbitration.began = None;
         // A held begin has never reached the system. Releasing it on reset
         // preserves native delivery; subsequent events pass normally.
-        for sequence in [&mut self.app, &mut self.scroll] {
+        for sequence in [&mut self.app, &mut self.vertical_app, &mut self.scroll] {
             for held in sequence.held.drain(..) {
                 repost(&held);
             }
@@ -397,6 +416,68 @@ fn repost(event: &CGEvent) {
 mod tests {
     use super::*;
     #[test]
+    fn vertical_dock_begin_can_precede_physical_acquisition() {
+        let event = CGEvent::new(None).unwrap();
+        CGEvent::set_integer_value_field(Some(&event), HID_TYPE, 23);
+        CGEvent::set_integer_value_field(Some(&event), MOTION, 2);
+        CGEvent::set_integer_value_field(Some(&event), PHASE, 1);
+        let mut filter = Filter::default();
+        assert!(!filter.forward(
+            CGEventType(30),
+            &event,
+            true,
+            || Box::new(Ownership::default()),
+            |_| {}
+        ));
+        let mut owner = Ownership {
+            session: 1,
+            owner: Owner::Undecided,
+            consume: true,
+            touching: true,
+            vertical: true,
+            ..Default::default()
+        };
+        CGEvent::set_integer_value_field(Some(&event), PHASE, 2);
+        assert!(!filter.forward(CGEventType(30), &event, true, || &mut owner, |_| {}));
+        assert_eq!(owner.dock_owner, Some(Owner::Rift));
+        owner.owner = Owner::Rift;
+        filter.reset();
+        CGEvent::set_integer_value_field(Some(&event), PHASE, 4);
+        assert!(!filter.forward(CGEventType(30), &event, true, || &mut owner, |_| {}));
+    }
+
+    #[test]
+    fn vertical_native_sequences_are_owned_only_when_configured() {
+        for ty in [CGEventType(29), CGEventType(30)] {
+            for enabled in [false, true] {
+                for consume in [false, true] {
+                    let mut filter = Filter::default();
+                    let mut owner = Ownership {
+                        session: 1,
+                        owner: Owner::Rift,
+                        touching: true,
+                        vertical: enabled,
+                        consume,
+                        ..Default::default()
+                    };
+                    let event = CGEvent::new(None).unwrap();
+                    CGEvent::set_integer_value_field(Some(&event), HID_TYPE, 23);
+                    CGEvent::set_integer_value_field(Some(&event), MOTION, 2);
+                    for phase in [1, 2, 4] {
+                        CGEvent::set_integer_value_field(Some(&event), PHASE, phase);
+                        assert_eq!(
+                            filter.forward(ty, &event, enabled, || Box::new(owner), |_| {}),
+                            !(enabled && consume)
+                        );
+                        // Suppression survives physical lift until native completion.
+                        owner.touching = false;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ownership_transitions_preserve_native_sequences() {
         let now = Instant::now();
         let mut a = Arbitration::default();
@@ -405,6 +486,8 @@ mod tests {
             owner: Owner::Undecided,
             consume: true,
             touching: true,
+            horizontal: true,
+            vertical: false,
             dock_owner: None,
         };
         assert_eq!(a.decide(1, o, now), Decision::Hold);
@@ -419,6 +502,8 @@ mod tests {
             owner: Owner::Undecided,
             consume: true,
             touching: true,
+            horizontal: true,
+            vertical: false,
             dock_owner: None,
         };
         assert_eq!(a.decide(2, o, now), Decision::Forward);
@@ -444,6 +529,8 @@ mod tests {
             owner: Owner::Undecided,
             consume: true,
             touching: true,
+            horizontal: true,
+            vertical: false,
             dock_owner: None,
             ..Default::default()
         };
@@ -464,15 +551,17 @@ mod tests {
             owner: Owner::Rift,
             consume: true,
             touching: true,
+            horizontal: true,
+            vertical: false,
             dock_owner: None,
         };
         for subtype in [11, 17, 18, 19] {
             CGEvent::set_integer_value_field(Some(&event), HID_TYPE, subtype);
-            assert!(f.forward(CGEventType(29), &event, || Box::new(o), |_| {}));
+            assert!(f.forward(CGEventType(29), &event, false, || Box::new(o), |_| {}));
         }
         CGEvent::set_integer_value_field(Some(&event), HID_TYPE, 23);
         CGEvent::set_integer_value_field(Some(&event), MOTION, 2);
-        assert!(f.forward(CGEventType(30), &event, || Box::new(o), |_| {}));
+        assert!(f.forward(CGEventType(30), &event, false, || Box::new(o), |_| {}));
         CGEvent::set_integer_value_field(Some(&event), MOTION, 1);
         CGEvent::set_integer_value_field(Some(&event), PHASE, 1);
         CGEvent::set_integer_value_field(
@@ -482,13 +571,13 @@ mod tests {
         );
         for phase in [1, 2, 4] {
             CGEvent::set_integer_value_field(Some(&event), PHASE, phase);
-            assert!(f.forward(CGEventType(30), &event, || Box::new(o), |_| {}));
+            assert!(f.forward(CGEventType(30), &event, false, || Box::new(o), |_| {}));
         }
         CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUnixProcessID, 0);
         CGEvent::set_integer_value_field(Some(&event), PHASE, 1);
-        assert!(!f.forward(CGEventType(30), &event, || Box::new(o), |_| {}));
+        assert!(!f.forward(CGEventType(30), &event, false, || Box::new(o), |_| {}));
         CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, REPOST);
-        assert!(f.forward(CGEventType(30), &event, || Box::new(o), |_| {}));
+        assert!(f.forward(CGEventType(30), &event, false, || Box::new(o), |_| {}));
     }
     #[test]
     fn cancellation_clears_native_velocity_and_scroll_momentum() {
@@ -566,13 +655,28 @@ mod tests {
             owner: Owner::Rift,
             consume: true,
             touching: true,
+            horizontal: true,
+            vertical: false,
             dock_owner: None,
         };
-        assert!(!filter.forward(CGEventType::ScrollWheel, &scroll(1), || Box::new(owner), |_| {}));
-        assert!(!filter.forward(CGEventType::ScrollWheel, &scroll(4), || Box::new(owner), |_| {}));
+        assert!(!filter.forward(
+            CGEventType::ScrollWheel,
+            &scroll(1),
+            false,
+            || Box::new(owner),
+            |_| {}
+        ));
+        assert!(!filter.forward(
+            CGEventType::ScrollWheel,
+            &scroll(4),
+            false,
+            || Box::new(owner),
+            |_| {}
+        ));
         assert!(filter.forward(
             CGEventType::ScrollWheel,
             &scroll(0),
+            false,
             || Box::new(Ownership::default()),
             |_| {}
         ));
@@ -585,6 +689,7 @@ mod tests {
         assert!(!filter.forward(
             CGEventType::ScrollWheel,
             &momentum,
+            false,
             || Box::new(Ownership::default()),
             |_| {}
         ));

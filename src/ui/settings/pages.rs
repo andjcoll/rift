@@ -922,6 +922,19 @@ fn input(ui: Ui, model: &Rc<Model>) -> Page {
         |s| &mut s.settings.gestures,
     );
     page = page.section(section.content(Disclosure::new(&ui, "Advanced swipe settings", tuning)));
+    let section = f.schema_section(
+        "Mission Control swipes",
+        "mission_control",
+        |s| &s.settings.gestures,
+        |s| &mut s.settings.gestures,
+    ).description("Swipe up to open Rift’s Mission Control and down to close it. Enable Mission Control first. Uses the workspace swipe haptic and macOS consumption settings.");
+    let tuning = f.schema_section(
+        "",
+        "mission_control_advanced",
+        |s| &s.settings.gestures,
+        |s| &mut s.settings.gestures,
+    );
+    page = page.section(section.content(Disclosure::new(&ui, "Advanced swipe settings", tuning)));
     let mut section = Section::new(&ui, "Scrolling layout gestures")
         .description("These gestures navigate the Scrolling layout strip.");
     let mut tuning = Section::new(&ui, "");
